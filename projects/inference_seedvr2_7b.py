@@ -14,6 +14,14 @@
 
 import os
 import torch
+import warnings
+
+warnings.filterwarnings(action='ignore', category=torch.jit.TracerWarning)
+warnings.filterwarnings(action='ignore', category=torch.jit.ScriptWarning)
+warnings.filterwarnings(action='ignore', category=UserWarning)
+warnings.filterwarnings(action='ignore', category=FutureWarning)
+warnings.filterwarnings(action='ignore', category=DeprecationWarning)
+
 import mediapy
 from einops import rearrange
 from omegaconf import OmegaConf
@@ -56,6 +64,7 @@ from common.distributed.ops import sync_data
 from common.seed import set_seed
 from common.partition import partition_by_groups, partition_by_size
 import argparse
+from common.utils import tiktok, print_rank, print_rank0
 
 def configure_sequence_parallel(sp_size):
     if sp_size > 1:
@@ -86,11 +95,14 @@ def generation_step(runner, text_embeds_dict, cond_latents):
 
     noises = [torch.randn_like(latent) for latent in cond_latents]
     aug_noises = [torch.randn_like(latent) for latent in cond_latents]
-    print(f"Generating with noise shape: {noises[0].size()}.")
-    noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
-    noises, aug_noises, cond_latents = list(
-        map(lambda x: _move_to_cuda(x), (noises, aug_noises, cond_latents))
-    )
+    # print(f"Generating with noise shape: {noises[0].size()}.")
+    print_rank0(f'noises: {noises[0].shape}\n', end='')
+    with tiktok('sync_data'):
+        noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
+    with tiktok('_move_to_cuda'):
+        noises, aug_noises, cond_latents = list(
+            map(lambda x: _move_to_cuda(x), (noises, aug_noises, cond_latents))
+        )
     cond_noise_scale = 0.0
 
     def _add_noise(x, aug_noise):
@@ -100,23 +112,25 @@ def generation_step(runner, text_embeds_dict, cond_latents):
         )
         shape = torch.tensor(x.shape[1:], device=get_device())[None]
         t = runner.timestep_transform(t, shape)
-        print(
-            f"Timestep shifting from"
-            f" {1000.0 * cond_noise_scale} to {t}."
-        )
+        # print(
+        #     f"Timestep shifting from"
+        #     f" {1000.0 * cond_noise_scale} to {t}."
+        # )
         x = runner.schedule.forward(x, aug_noise, t)
         return x
 
-    conditions = [
-        runner.get_condition(
-            noise,
-            task="sr",
-            latent_blur=_add_noise(latent_blur, aug_noise),
-        )
-        for noise, aug_noise, latent_blur in zip(noises, aug_noises, cond_latents)
-    ]
+    with tiktok('get_condition'):
+        conditions = [
+            runner.get_condition(
+                noise,
+                task="sr",
+                latent_blur=_add_noise(latent_blur, aug_noise),
+            )
+            for noise, aug_noise, latent_blur in zip(noises, aug_noises, cond_latents)
+        ]
 
     with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
+        # with tiktok('runner.inference'):
         video_tensors = runner.inference(
             noises=noises,
             conditions=conditions,
@@ -209,7 +223,8 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
     tgt_path = output_dir
 
     # get test prompts
-    original_videos, _, _ = _build_test_prompts(video_path)
+    with tiktok('_build_test_prompts'):
+        original_videos, _, _ = _build_test_prompts(video_path)
 
     # divide the prompts into different groups
     original_videos_group = partition_by_groups(
@@ -223,7 +238,8 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
     original_videos_local = partition_by_size(original_videos_local, batch_size)
 
     # pre-extract the text embeddings
-    positive_prompts_embeds = _extract_text_embeds()
+    with tiktok('_extract_text_embeds'):
+        positive_prompts_embeds = _extract_text_embeds()
 
     video_transform = Compose(
         [
@@ -248,7 +264,7 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
         # read condition latents
         cond_latents = []
         fps_lists = []
-        for video in videos:
+        for i, video in enumerate(videos):
             if is_image_file(video):
                 video = read_image(
                     os.path.join(video_path, video)
@@ -256,32 +272,43 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
                 if sp_size > 1:
                     raise ValueError("Sp size should be set to 1 for image inputs!")
             else:
-                video, _, info = read_video(
-                    os.path.join(video_path, video), output_format="TCHW"
-                    )
+                with tiktok(f'read_video[{i}]'):
+                    video, _, info = read_video(
+                        os.path.join(video_path, video), output_format="TCHW"
+                        )
                 video = video / 255.0
                 fps_lists.append(info["video_fps"] if out_fps is None else out_fps)
-            print(f"Read video size: {video.size()}")
+            # print(f"Read video size: {video.size()}")
+            print_rank0(f'video[{i}].shape={tuple(video.shape)}\n', end='')
             cond_latents.append(video_transform(video.to(get_device())))
 
         ori_lengths = [video.size(1) for video in cond_latents]
         input_videos = cond_latents
-        cond_latents = [cut_videos(video, sp_size) for video in cond_latents]
+        with tiktok('cut_videos'):
+            cond_latents = [cut_videos(video, sp_size) for video in cond_latents]
 
-        runner.dit.to("cpu")
-        print(f"Encoding videos: {list(map(lambda x: x.size(), cond_latents))}")
-        runner.vae.to(get_device())
-        cond_latents = runner.vae_encode(cond_latents)
-        runner.vae.to("cpu")
-        runner.dit.to(get_device())
+        with tiktok('dit_to_cpu'):
+            runner.dit.to("cpu")
+        # print(f"Encoding videos: {list(map(lambda x: x.size(), cond_latents))}")
+        print_rank0(f'num_cond_latents={len(cond_latents)} shape: {tuple(cond_latents[0].shape)}\n', end='')
+        with tiktok('vae_to_cuda'):
+            runner.vae.to(get_device())
+        with tiktok('vae_encode'):
+            cond_latents = runner.vae_encode(cond_latents)
+        with tiktok('vae_to_cpu'):
+            runner.vae.to("cpu")
+        with tiktok('dit_to_cuda'):
+            runner.dit.to(get_device())
 
         for i, emb in enumerate(text_embeds["texts_pos"]):
             text_embeds["texts_pos"][i] = emb.to(get_device())
         for i, emb in enumerate(text_embeds["texts_neg"]):
             text_embeds["texts_neg"][i] = emb.to(get_device())
 
-        samples = generation_step(runner, text_embeds, cond_latents=cond_latents)
-        runner.dit.to("cpu")
+        with tiktok('generation_step'):
+            samples = generation_step(runner, text_embeds, cond_latents=cond_latents)
+        with tiktok('dit_to_cpu'):
+            runner.dit.to("cpu")
         del cond_latents
 
         # dump samples to the output directory
@@ -303,23 +330,27 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
                         sample.to("cpu"), input[: sample.size(0)].to("cpu")
                     )
                 else:
-                    sample = sample.to("cpu")
-                sample = (
-                    rearrange(sample[:, None], "t c h w -> t h w c")
-                    if sample.ndim == 3
-                    else rearrange(sample, "t c h w -> t h w c")
-                )
-                sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round()
-                sample = sample.to(torch.uint8).numpy()
-
-                if sample.shape[0] == 1:
-                    mediapy.write_image(filename, sample.squeeze(0))
-                else:
-                    mediapy.write_video(
-                        filename, sample, fps=save_fps
+                    with tiktok('video_to_cpu'):
+                        sample = sample.to("cpu")
+                with tiktok('video_post'):
+                    sample = (
+                        rearrange(sample[:, None], "t c h w -> t h w c")
+                        if sample.ndim == 3
+                        else rearrange(sample, "t c h w -> t h w c")
                     )
-        gc.collect()
-        torch.cuda.empty_cache()
+                    sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round()
+                    sample = sample.to(torch.uint8).numpy()
+
+                with tiktok('write_video'):
+                    if sample.shape[0] == 1:
+                        mediapy.write_image(filename, sample.squeeze(0))
+                    else:
+                        mediapy.write_video(
+                            filename, sample, fps=save_fps
+                        )
+        with tiktok('gc'):
+            gc.collect()
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser() 

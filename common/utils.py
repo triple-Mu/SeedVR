@@ -1,6 +1,54 @@
 import torch
 import torch.nn.functional as F
 
+
+from contextlib import contextmanager
+from pathlib import Path
+import inspect
+import torch.distributed as dist
+
+wd = Path('/root/paddlejob/workspace/env_run/SeedVR')
+
+@contextmanager
+def tiktok(tag: str, only_rank0: bool = True):
+    frame = inspect.currentframe()
+    line_number = frame.f_back.f_back.f_lineno
+    py_file = Path(inspect.getfile(frame.f_back.f_back))
+    py_file = py_file.relative_to(wd).as_posix()
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream(device)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    stream.synchronize()
+    start.record(stream)
+    yield
+    end.record(stream)
+    stream.synchronize()
+    cost = start.elapsed_time(end)
+    if only_rank0:
+        if device == 0:
+            print(f'{tag} "{py_file}:{line_number}" | {cost:.5f}ms |\n', end='')
+    else:
+        print(f'CUDA[{device}] | {tag} | {cost:.5f}ms |\n', end='')
+
+
+def print_rank(*args, **kwargs):
+    device = torch.cuda.current_device()
+    print(f'CUDA[{device}]: ', *args, **kwargs)
+
+
+def print_rank0(*args, **kwargs):
+    if torch.cuda.current_device() == 0:
+        print(*args, **kwargs)
+
+
+def print_one_by_one(group: dist.ProcessGroup, *args, **kwargs):
+    for rank in range(group.size()):
+        if rank == group.rank():
+            print(*args, **kwargs)
+        dist.barrier(group)
+
+
 def safe_pad_operation(x, padding, mode='constant', value=0.0):
     """Safe padding operation that handles Half precision only for problematic modes"""
     # Modes qui nécessitent le fix Half precision

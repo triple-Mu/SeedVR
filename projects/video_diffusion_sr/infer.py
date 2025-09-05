@@ -37,6 +37,7 @@ from common.distributed.meta_init_utils import (
 # from common.fs import download
 
 from models.dit_v2 import na
+from common.utils import tiktok, print_rank, print_rank0
 
 class VideoDiffusionInfer():
     def __init__(self, config: DictConfig):
@@ -276,23 +277,24 @@ class VideoDiffusionInfer():
 
         # Text embeddings.
         assert type(texts_pos[0]) is type(texts_neg[0])
-        if isinstance(texts_pos[0], str):
-            text_pos_embeds, text_pos_shapes = self.text_encode(texts_pos)
-            text_neg_embeds, text_neg_shapes = self.text_encode(texts_neg)
-        elif isinstance(texts_pos[0], tuple):
-            text_pos_embeds, text_pos_shapes = [], []
-            text_neg_embeds, text_neg_shapes = [], []
-            for pos in zip(*texts_pos):
-                emb, shape = na.flatten(pos)
-                text_pos_embeds.append(emb)
-                text_pos_shapes.append(shape)
-            for neg in zip(*texts_neg):
-                emb, shape = na.flatten(neg)
-                text_neg_embeds.append(emb)
-                text_neg_shapes.append(shape)
-        else:
-            text_pos_embeds, text_pos_shapes = na.flatten(texts_pos)
-            text_neg_embeds, text_neg_shapes = na.flatten(texts_neg)
+        with tiktok('text_encode'):
+            if isinstance(texts_pos[0], str):
+                text_pos_embeds, text_pos_shapes = self.text_encode(texts_pos)
+                text_neg_embeds, text_neg_shapes = self.text_encode(texts_neg)
+            elif isinstance(texts_pos[0], tuple):
+                text_pos_embeds, text_pos_shapes = [], []
+                text_neg_embeds, text_neg_shapes = [], []
+                for pos in zip(*texts_pos):
+                    emb, shape = na.flatten(pos)
+                    text_pos_embeds.append(emb)
+                    text_pos_shapes.append(shape)
+                for neg in zip(*texts_neg):
+                    emb, shape = na.flatten(neg)
+                    text_neg_embeds.append(emb)
+                    text_neg_shapes.append(shape)
+            else:
+                text_pos_embeds, text_pos_shapes = na.flatten(texts_pos)
+                text_neg_embeds, text_neg_shapes = na.flatten(texts_neg)
 
         # Flatten.
         latents, latents_shapes = na.flatten(noises)
@@ -303,17 +305,25 @@ class VideoDiffusionInfer():
         self.dit.eval()
 
         # Sampling.
+        def dit_forward_cond(*args, **kwargs):
+            with tiktok('dit_forward_cond'):
+                return self.dit(*args, **kwargs)
+
+        def dit_forward_uncond(*args, **kwargs):
+            with tiktok('dit_forward_uncond'):
+                return self.dit(*args, **kwargs)
+
         latents = self.sampler.sample(
             x=latents,
             f=lambda args: classifier_free_guidance_dispatcher(
-                pos=lambda: self.dit(
+                pos=lambda: dit_forward_cond(
                     vid=torch.cat([args.x_t, latents_cond], dim=-1),
                     txt=text_pos_embeds,
                     vid_shape=latents_shapes,
                     txt_shape=text_pos_shapes,
                     timestep=args.t.repeat(batch_size),
                 ).vid_sample,
-                neg=lambda: self.dit(
+                neg=lambda: dit_forward_uncond(
                     vid=torch.cat([args.x_t, latents_cond], dim=-1),
                     txt=text_neg_embeds,
                     vid_shape=latents_shapes,
@@ -337,12 +347,16 @@ class VideoDiffusionInfer():
         latents = na.unflatten(latents, latents_shapes)
 
         if dit_offload:
-            self.dit.to("cpu")
+            with tiktok('dit_to_cpu'):
+                self.dit.to("cpu")
 
         # Vae decode.
-        self.vae.to(get_device())
-        samples = self.vae_decode(latents)
+        with tiktok('vae_to_cuda'):
+            self.vae.to(get_device())
+        with tiktok('vae_decode'):
+            samples = self.vae_decode(latents)
 
         if dit_offload:
-            self.dit.to(get_device())
+            with tiktok('dit_to_cuda'):
+                self.dit.to(get_device())
         return samples
