@@ -59,3 +59,20 @@ def safe_interpolate_operation(x, size=None, scale_factor=None, mode='nearest', 
             align_corners=align_corners,
             recompute_scale_factor=recompute_scale_factor
         )
+
+
+import pynvml
+
+_HANDLE_: pynvml.c_nvmlDevice_t = None
+
+
+def current_cuda_mem_used_gb(index: int = None):
+    if index is None:
+        index = 0
+    global _HANDLE_
+    if _HANDLE_ is None:
+        pynvml.nvmlInit()
+        _HANDLE_ = pynvml.nvmlDeviceGetHandleByIndex(index)
+
+    mem_info: pynvml.c_nvmlMemory_t = pynvml.nvmlDeviceGetMemoryInfo(_HANDLE_)
+    return mem_info.used / (1 << 30)

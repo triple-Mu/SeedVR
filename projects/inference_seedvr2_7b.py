@@ -78,6 +78,7 @@ def configure_runner(sp_size):
     # Set memory limit.
     if hasattr(runner.vae, "set_memory_limit"):
         runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+    runner.vae.to("cuda")
     return runner
 
 def generation_step(runner, text_embeds_dict, cond_latents):
@@ -268,12 +269,12 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
         input_videos = cond_latents
         cond_latents = [cut_videos(video, sp_size) for video in cond_latents]
 
-        runner.dit.to("cpu")
+        # runner.dit.to("cpu")
         print(f"Encoding videos: {list(map(lambda x: x.size(), cond_latents))}")
-        runner.vae.to(get_device())
+        # runner.vae.to(get_device())
         cond_latents = runner.vae_encode(cond_latents)
-        runner.vae.to("cpu")
-        runner.dit.to(get_device())
+        # runner.vae.to("cpu")
+        # runner.dit.to(get_device())
 
         for i, emb in enumerate(text_embeds["texts_pos"]):
             text_embeds["texts_pos"][i] = emb.to(get_device())
@@ -281,7 +282,7 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
             text_embeds["texts_neg"][i] = emb.to(get_device())
 
         samples = generation_step(runner, text_embeds, cond_latents=cond_latents)
-        runner.dit.to("cpu")
+        # runner.dit.to("cpu")
         del cond_latents
 
         # dump samples to the output directory

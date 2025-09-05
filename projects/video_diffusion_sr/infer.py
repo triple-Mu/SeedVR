@@ -70,7 +70,7 @@ class VideoDiffusionInfer():
 
     @log_on_entry
     @log_runtime
-    def configure_dit_model(self, device="cpu", checkpoint=None):
+    def configure_dit_model(self, device="cpu", checkpoint=None, enable_fsdp: bool = True):
         # Load dit checkpoint.
         # For fast init & resume,
         #   when training from scratch, rank0 init DiT on cpu, then sync to other ranks with FSDP.
@@ -92,6 +92,27 @@ class VideoDiffusionInfer():
             print(f"Loading info: {loading_info}")
             self.dit = meta_non_persistent_buffer_init_fn(self.dit)
 
+        if enable_fsdp and len(dtypes := list(set(p.dtype for p in self.dit.parameters()))) == 1:
+            print(f'{dtypes=}\n', end='')
+            import torch.distributed as dist
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+            from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+            from functools import partial
+            lambda_fn = lambda m: m in self.dit.blocks 
+            self.dit = FSDP(
+                module=self.dit,
+                process_group=dist.GroupMember.WORLD,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                auto_wrap_policy=partial(lambda_auto_wrap_policy, lambda_fn=lambda_fn),
+                mixed_precision=MixedPrecision(
+                    param_dtype=dtypes[0],
+                    reduce_dtype=torch.float32,
+                    buffer_dtype=torch.float32
+                ),
+                device_id=get_global_rank(),
+                sync_module_states=True,
+            )
         if device in [get_device(), "cuda"]:
             self.dit.to(get_device())
 
@@ -299,7 +320,7 @@ class VideoDiffusionInfer():
         latents_cond, _ = na.flatten(conditions)
 
         # Enter eval mode.
-        was_training = self.dit.training
+        # was_training = self.dit.training
         self.dit.eval()
 
         # Sampling.
@@ -331,18 +352,18 @@ class VideoDiffusionInfer():
         )
 
         # Exit eval mode.
-        self.dit.train(was_training)
+        # self.dit.train(was_training)
 
         # Unflatten.
         latents = na.unflatten(latents, latents_shapes)
 
-        if dit_offload:
-            self.dit.to("cpu")
+        # if dit_offload:
+            # self.dit.to("cpu")
 
         # Vae decode.
-        self.vae.to(get_device())
+        # self.vae.to(get_device())
         samples = self.vae_decode(latents)
 
-        if dit_offload:
-            self.dit.to(get_device())
+        # if dit_offload:
+            # self.dit.to(get_device())
         return samples
