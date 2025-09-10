@@ -37,6 +37,8 @@ from common.distributed.meta_init_utils import (
 # from common.fs import download
 
 from models.dit_v2 import na
+from common.utils import nvtx, tiktok
+
 
 class VideoDiffusionInfer():
     def __init__(self, config: DictConfig):
@@ -160,15 +162,16 @@ class VideoDiffusionInfer():
                 batches = [sample.unsqueeze(0) for sample in samples]
 
             # Vae process by each group.
-            for sample in batches:
+            for i, sample in enumerate(batches):
                 sample = sample.to(device, dtype)
                 if hasattr(self.vae, "preprocess"):
                     sample = self.vae.preprocess(sample)
-                if use_sample:
-                    latent = self.vae.encode(sample).latent
-                else:
-                    # Deterministic vae encode, only used for i2v inference (optionally)
-                    latent = self.vae.encode(sample).posterior.mode().squeeze(2)
+                with nvtx(f'inside_vae_encode_{i}'):
+                    if use_sample:
+                        latent = self.vae.encode(sample).latent
+                    else:
+                        # Deterministic vae encode, only used for i2v inference (optionally)
+                        latent = self.vae.encode(sample).posterior.mode().squeeze(2)
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
                 latent = rearrange(latent, "b c ... -> b ... c")
                 latent = (latent - shift) * scale
@@ -203,12 +206,13 @@ class VideoDiffusionInfer():
                 latents = [latent.unsqueeze(0) for latent in latents]
 
             # Vae process by each group.
-            for latent in latents:
+            for i, latent in enumerate(latents):
                 latent = latent.to(device, dtype)
                 latent = latent / scale + shift
                 latent = rearrange(latent, "b ... c -> b c ...")
                 latent = latent.squeeze(2)
-                sample = self.vae.decode(latent).sample
+                with nvtx(f'inside_vae_decode_{i}'):
+                    sample = self.vae.decode(latent).sample
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)
                 samples.append(sample)
@@ -302,18 +306,22 @@ class VideoDiffusionInfer():
         was_training = self.dit.training
         self.dit.eval()
 
+        def dit_fwd(*args, **kwargs):
+            with nvtx('inside_dit_fwd'), tiktok('inside_dit_fwd'):
+                return self.dit(*args, **kwargs)
+
         # Sampling.
         latents = self.sampler.sample(
             x=latents,
             f=lambda args: classifier_free_guidance_dispatcher(
-                pos=lambda: self.dit(
+                pos=lambda: dit_fwd(
                     vid=torch.cat([args.x_t, latents_cond], dim=-1),
                     txt=text_pos_embeds,
                     vid_shape=latents_shapes,
                     txt_shape=text_pos_shapes,
                     timestep=args.t.repeat(batch_size),
                 ).vid_sample,
-                neg=lambda: self.dit(
+                neg=lambda: dit_fwd(
                     vid=torch.cat([args.x_t, latents_cond], dim=-1),
                     txt=text_neg_embeds,
                     vid_shape=latents_shapes,
@@ -340,8 +348,9 @@ class VideoDiffusionInfer():
             self.dit.to("cpu")
 
         # Vae decode.
-        self.vae.to(get_device())
-        samples = self.vae_decode(latents)
+        with nvtx('inside_vae_decode'), tiktok('inside_vae_decode'):
+            self.vae.to(get_device())
+            samples = self.vae_decode(latents)
 
         if dit_offload:
             self.dit.to(get_device())

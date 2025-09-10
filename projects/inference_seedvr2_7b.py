@@ -22,13 +22,14 @@ import datetime
 from tqdm import tqdm
 from models.dit import na
 import gc
+import time
 
 from data.image.transforms.divisible_crop import DivisibleCrop
 from data.image.transforms.na_resize import NaResize
 from data.video.transforms.rearrange import Rearrange
 if os.path.exists("./projects/video_diffusion_sr/color_fix.py"):
     from projects.video_diffusion_sr.color_fix import wavelet_reconstruction
-    use_colorfix=True
+    use_colorfix = True
 else:
     use_colorfix = False
     print('Note!!!!!! Color fix is not avaliable!')
@@ -57,6 +58,8 @@ from common.seed import set_seed
 from common.partition import partition_by_groups, partition_by_size
 import argparse
 
+from common.utils import tiktok, print_rank, print_rank0, print_one_by_one, nvtx
+
 def configure_sequence_parallel(sp_size):
     if sp_size > 1:
         init_sequence_parallel(sp_size)
@@ -78,6 +81,7 @@ def configure_runner(sp_size):
     # Set memory limit.
     if hasattr(runner.vae, "set_memory_limit"):
         runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+    runner.vae.to("cuda")
     return runner
 
 def generation_step(runner, text_embeds_dict, cond_latents):
@@ -87,10 +91,11 @@ def generation_step(runner, text_embeds_dict, cond_latents):
     noises = [torch.randn_like(latent) for latent in cond_latents]
     aug_noises = [torch.randn_like(latent) for latent in cond_latents]
     print(f"Generating with noise shape: {noises[0].size()}.")
-    noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
-    noises, aug_noises, cond_latents = list(
-        map(lambda x: _move_to_cuda(x), (noises, aug_noises, cond_latents))
-    )
+    with nvtx('sync_data_to_cuda'), tiktok('sync_data_to_cuda'):
+        noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
+        noises, aug_noises, cond_latents = list(
+            map(lambda x: _move_to_cuda(x), (noises, aug_noises, cond_latents))
+        )
     cond_noise_scale = 0.0
 
     def _add_noise(x, aug_noise):
@@ -107,20 +112,21 @@ def generation_step(runner, text_embeds_dict, cond_latents):
         x = runner.schedule.forward(x, aug_noise, t)
         return x
 
-    conditions = [
-        runner.get_condition(
-            noise,
-            task="sr",
-            latent_blur=_add_noise(latent_blur, aug_noise),
-        )
-        for noise, aug_noise, latent_blur in zip(noises, aug_noises, cond_latents)
-    ]
+    with nvtx('get_conditions'), tiktok('get_conditions'):
+        conditions = [
+            runner.get_condition(
+                noise,
+                task="sr",
+                latent_blur=_add_noise(latent_blur, aug_noise),
+            )
+            for noise, aug_noise, latent_blur in zip(noises, aug_noises, cond_latents)
+        ]
 
     with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
         video_tensors = runner.inference(
             noises=noises,
             conditions=conditions,
-            dit_offload=True,
+            dit_offload=False,
             **text_embeds_dict,
         )
 
@@ -244,11 +250,18 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
     )
 
     # generation loop
+    count = 0
+    start = time.perf_counter()
+    prev = start
     for videos, text_embeds in tqdm(zip(original_videos_local, positive_prompts_embeds)):
+        now = time.perf_counter()
+        elapsed = now - prev
+        if prev != start:
+            print_rank0(f'videos[{count}] 耗时: {elapsed:.5f}s\n', end='')
         # read condition latents
         cond_latents = []
         fps_lists = []
-        for video in videos:
+        for i, video in enumerate(videos):
             if is_image_file(video):
                 video = read_image(
                     os.path.join(video_path, video)
@@ -256,70 +269,90 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
                 if sp_size > 1:
                     raise ValueError("Sp size should be set to 1 for image inputs!")
             else:
-                video, _, info = read_video(
-                    os.path.join(video_path, video), output_format="TCHW"
-                    )
-                video = video / 255.0
+                with nvtx(f'read_video[{i}]'), tiktok(f'read_video[{i}]'):
+                    video, _, info = read_video(
+                        os.path.join(video_path, video), output_format="TCHW"
+                        )
+                    video = video / 255.0
                 fps_lists.append(info["video_fps"] if out_fps is None else out_fps)
             print(f"Read video size: {video.size()}")
-            cond_latents.append(video_transform(video.to(get_device())))
+            with nvtx(f'transform_video[{i}]'), tiktok(f'transform_video[{i}]'):
+                cond_latents.append(video_transform(video.to(get_device())))
 
+        if count == 5 and torch.cuda.current_device() == 0:
+            torch.cuda.cudart().cudaProfilerStart()
         ori_lengths = [video.size(1) for video in cond_latents]
         input_videos = cond_latents
-        cond_latents = [cut_videos(video, sp_size) for video in cond_latents]
+        with tiktok('cut_videos'):
+            cond_latents = [cut_videos(video, sp_size) for video in cond_latents]
 
-        runner.dit.to("cpu")
+        # runner.dit.to("cpu") # only move to cpu once
         print(f"Encoding videos: {list(map(lambda x: x.size(), cond_latents))}")
-        runner.vae.to(get_device())
-        cond_latents = runner.vae_encode(cond_latents)
-        runner.vae.to("cpu")
-        runner.dit.to(get_device())
+        # runner.vae.to(get_device()) # always on cuda
+        with nvtx('vae_encode'):
+            cond_latents = runner.vae_encode(cond_latents)
+        # runner.vae.to("cpu") # only move to cpu once
+        with nvtx('dit_to_cuda'):
+            runner.dit.to(get_device()) # only move to cuda once
 
-        for i, emb in enumerate(text_embeds["texts_pos"]):
-            text_embeds["texts_pos"][i] = emb.to(get_device())
-        for i, emb in enumerate(text_embeds["texts_neg"]):
-            text_embeds["texts_neg"][i] = emb.to(get_device())
+        with nvtx('text_to_cuda'):
+            for i, emb in enumerate(text_embeds["texts_pos"]):
+                text_embeds["texts_pos"][i] = emb.to(get_device())
+            for i, emb in enumerate(text_embeds["texts_neg"]):
+                text_embeds["texts_neg"][i] = emb.to(get_device())
 
         samples = generation_step(runner, text_embeds, cond_latents=cond_latents)
-        runner.dit.to("cpu")
+        with nvtx('dit_to_cpu'):
+            runner.dit.to("cpu", non_blocking=True) # only move to cpu once by non_blocking
         del cond_latents
 
         # dump samples to the output directory
         if get_sequence_parallel_rank() == 0:
+            vi = 0
             for path, input, sample, ori_length, save_fps in zip(
                 videos, input_videos, samples, ori_lengths, fps_lists
             ):
-                if ori_length < sample.shape[0]:
-                    sample = sample[:ori_length]
-                filename = os.path.join(tgt_path, os.path.basename(path))
-                # color fix
-                input = (
-                    rearrange(input[:, None], "c t h w -> t c h w")
-                    if input.ndim == 3
-                    else rearrange(input, "c t h w -> t c h w")
-                )
-                if use_colorfix:
-                    sample = wavelet_reconstruction(
-                        sample.to("cpu"), input[: sample.size(0)].to("cpu")
+                with nvtx(f'post_video[{vi}]'), tiktok(f'post_video[{vi}]'):
+                    if ori_length < sample.shape[0]:
+                        sample = sample[:ori_length]
+                    filename = os.path.join(tgt_path, os.path.basename(path))
+                    # color fix
+                    input = (
+                        rearrange(input[:, None], "c t h w -> t c h w")
+                        if input.ndim == 3
+                        else rearrange(input, "c t h w -> t c h w")
                     )
-                else:
-                    sample = sample.to("cpu")
-                sample = (
-                    rearrange(sample[:, None], "t c h w -> t h w c")
-                    if sample.ndim == 3
-                    else rearrange(sample, "t c h w -> t h w c")
-                )
-                sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round()
-                sample = sample.to(torch.uint8).numpy()
+                    if use_colorfix:
+                        sample = wavelet_reconstruction(
+                            sample.to("cpu"), input[: sample.size(0)].to("cpu")
+                        )
+                    else:
+                        sample = sample.to("cpu")
+                    sample = (
+                        rearrange(sample[:, None], "t c h w -> t h w c")
+                        if sample.ndim == 3
+                        else rearrange(sample, "t c h w -> t h w c")
+                    )
+                    sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round()
+                    sample = sample.to(torch.uint8).numpy()
 
-                if sample.shape[0] == 1:
-                    mediapy.write_image(filename, sample.squeeze(0))
-                else:
-                    mediapy.write_video(
-                        filename, sample, fps=save_fps
-                    )
-        gc.collect()
-        torch.cuda.empty_cache()
+                with nvtx(f'dump_video[{vi}]'), tiktok(f'dump_video[{vi}]'):
+                    if sample.shape[0] == 1:
+                        mediapy.write_image(filename, sample.squeeze(0))
+                    else:
+                        mediapy.write_video(
+                            filename, sample, fps=save_fps
+                        )
+                vi += 1
+        with tiktok('gc'):
+            gc.collect()
+            torch.cuda.empty_cache()
+        if count == 5 and torch.cuda.current_device() == 0:
+            torch.cuda.cudart().cudaProfilerStop()
+        count += 1
+        prev = now
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser() 
