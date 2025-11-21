@@ -71,14 +71,14 @@ class AdaSingle(nn.Module):
         emb = rearrange(emb, "b (d l g) -> b d l g", l=len(self.layers), g=3)[..., idx, :]
         emb = expand_dims(emb, 1, hid.ndim + 1)
 
-        if hid_len is not None:
-            emb = cache(
-                f"emb_repeat_{idx}_{branch_tag}",
-                lambda: slice_inputs(
-                    torch.cat([e.repeat(l, *([1] * e.ndim)) for e, l in zip(emb, hid_len)]),
-                    dim=0,
-                ),
-            )
+        # if hid_len is not None:
+        #     emb = cache(
+        #         f"emb_repeat_{idx}_{branch_tag}",
+        #         lambda: slice_inputs(
+        #             torch.cat([e.repeat(l, *([1] * e.ndim)) for e, l in zip(emb, hid_len)]),
+        #             dim=0,
+        #         ),
+        #     )
 
         shiftA, scaleA, gateA = emb.unbind(-1)
         shiftB, scaleB, gateB = (

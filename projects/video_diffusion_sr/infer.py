@@ -93,7 +93,8 @@ class VideoDiffusionInfer():
             self.dit = meta_non_persistent_buffer_init_fn(self.dit)
 
         if device in [get_device(), "cuda"]:
-            self.dit.to(get_device())
+            self.dit.to(get_device(), dtype=torch.bfloat16)
+        self.dit.requires_grad_(False).eval()
 
         # Print model size.
         num_params = sum(p.numel() for p in self.dit.parameters() if p.requires_grad)
@@ -301,6 +302,7 @@ class VideoDiffusionInfer():
         # Enter eval mode.
         was_training = self.dit.training
         self.dit.eval()
+        self.dit.to(get_device(), non_blocking=True)
 
         # Sampling.
         latents = self.sampler.sample(
@@ -329,7 +331,7 @@ class VideoDiffusionInfer():
                 rescale=self.config.diffusion.cfg.rescale,
             ),
         )
-
+        self.dit.to('cpu', non_blocking=True)
         # Exit eval mode.
         self.dit.train(was_training)
 
@@ -337,12 +339,13 @@ class VideoDiffusionInfer():
         latents = na.unflatten(latents, latents_shapes)
 
         if dit_offload:
-            self.dit.to("cpu")
+            self.dit.to("cpu", non_blocking=True)
 
         # Vae decode.
-        self.vae.to(get_device())
+        self.vae.to(get_device(), non_blocking=True)
         samples = self.vae_decode(latents)
+        self.vae.to('cpu', non_blocking=True)
 
         if dit_offload:
-            self.dit.to(get_device())
+            self.dit.to(get_device(), non_blocking=True)
         return samples

@@ -120,7 +120,7 @@ def generation_step(runner, text_embeds_dict, cond_latents):
         video_tensors = runner.inference(
             noises=noises,
             conditions=conditions,
-            dit_offload=True,
+            dit_offload=False,
             **text_embeds_dict,
         )
 
@@ -268,12 +268,18 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
         input_videos = cond_latents
         cond_latents = [cut_videos(video, sp_size) for video in cond_latents]
 
-        runner.dit.to("cpu")
+        # runner.dit.to("cpu", non_blocking=True)
         print(f"Encoding videos: {list(map(lambda x: x.size(), cond_latents))}")
-        runner.vae.to(get_device())
+        runner.vae.to(get_device(), non_blocking=True)
         cond_latents = runner.vae_encode(cond_latents)
-        runner.vae.to("cpu")
-        runner.dit.to(get_device())
+        runner.vae.to("cpu", non_blocking=True)
+
+        for n, m in runner.vae.encoder.named_modules():
+            if hasattr(m, 'memory') and isinstance(m.memory, torch.Tensor):
+                print(f'GPU[{m.memory.device.index}], {n} clear memory\n', end='')
+                m.memory = None
+
+        # runner.dit.to(get_device(), non_blocking=True)
 
         for i, emb in enumerate(text_embeds["texts_pos"]):
             text_embeds["texts_pos"][i] = emb.to(get_device())
@@ -281,7 +287,7 @@ def generation_loop(runner, video_path='./test_videos', output_dir='./results', 
             text_embeds["texts_neg"][i] = emb.to(get_device())
 
         samples = generation_step(runner, text_embeds, cond_latents=cond_latents)
-        runner.dit.to("cpu")
+        # runner.dit.to("cpu")
         del cond_latents
 
         # dump samples to the output directory
